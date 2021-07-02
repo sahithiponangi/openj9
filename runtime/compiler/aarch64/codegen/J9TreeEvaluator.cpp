@@ -3371,6 +3371,379 @@ J9::ARM64::TreeEvaluator::ArrayStoreCHKEvaluator(TR::Node *node, TR::CodeGenerat
    return NULL;
    }
 
+/*
+ * Arraycopy evaluator needs a version of inlineArrayCopy that can be used inside internal control flow. For this version of inlineArrayCopy, registers must
+ * be allocated outside of this function so the dependency at the end of the control flow knows about them.
+ */
+static void inlineArrayCopy(TR::Node *node, int64_t byteLen, TR::Register *src, TR::Register *dst, TR::CodeGenerator *cg)
+   {
+   TR::Register *regs = NULL;
+
+   //  byteLen reg
+   regs = cg->allocateRegister(TR_GPR);
+   TR::Register *reg = cg->allocateRegister(TR_VRF);
+   TR_ASSERT(byteLen <= 4096, "Maximum value of byteLen can only be 4096");
+
+   TR::DataType srcdataType = node->getChild(0)->getDataType();
+   TR::DataType dstdataType = node->getChild(1)->getDataType();
+   size_t dataSize = node->getChild(1)->getSize();
+   int32_t standingOffset = 0;
+   if(srcdataType == dstdataType)
+      {
+      for(int64_t i = 0; i < byteLen; i = i + dataSize)
+         {
+         switch (dataSize)
+            {
+            case 1:
+               standingOffset += i;
+               generateTrg1MemInstruction(cg, TR::InstOpCode::ldrsbimmx, node, regs, new (cg->trHeapMemory()) TR::MemoryReference(src, standingOffset, cg));
+               generateMemSrc1Instruction(cg, TR::InstOpCode::strbimm, node, new (cg->trHeapMemory()) TR::MemoryReference(dst, standingOffset, cg), regs);
+            case 2:
+               standingOffset += i*2;
+               generateTrg1MemInstruction(cg, TR::InstOpCode::ldrshimmx, node, regs, new (cg->trHeapMemory()) TR::MemoryReference(src, standingOffset, cg));
+               generateMemSrc1Instruction(cg, TR::InstOpCode::strhimm, node, new (cg->trHeapMemory()) TR::MemoryReference(dst, standingOffset, cg), regs);
+            case 4:
+               standingOffset += i*4;
+               generateTrg1MemInstruction(cg, TR::InstOpCode::ldrswimm, node, regs, new (cg->trHeapMemory()) TR::MemoryReference(src, standingOffset, cg));
+               generateMemSrc1Instruction(cg, TR::InstOpCode::strimmw, node, new (cg->trHeapMemory()) TR::MemoryReference(dst, standingOffset, cg), regs);
+            case 8:
+               standingOffset += i*8;
+               generateTrg1MemInstruction(cg, TR::InstOpCode::ldrimmx, node, regs, new (cg->trHeapMemory()) TR::MemoryReference(src, standingOffset, cg));
+               generateMemSrc1Instruction(cg, TR::InstOpCode::strimmx, node, new (cg->trHeapMemory()) TR::MemoryReference(dst, standingOffset, cg), regs);
+            case 16:
+               standingOffset += i*16;
+               generateTrg1MemInstruction(cg, TR::InstOpCode::vldrimmq, node, reg, new (cg->trHeapMemory()) TR::MemoryReference(src, standingOffset, cg));
+               generateMemSrc1Instruction(cg, TR::InstOpCode::vstrimmq, node, new (cg->trHeapMemory()) TR::MemoryReference(dst, standingOffset, cg), regs);
+           default:
+               TR_ASSERT(false, "Argument type %s is not supported\n", dstdataType.toString());
+            }
+         }
+      }
+   cg->stopUsingRegister(regs);
+   return;
+   }
+
+TR::Register *
+J9::ARM64::TreeEvaluator::arraycopyEvaluator(TR::Node *node, TR::CodeGenerator *cg)
+   {
+#ifdef OMR_GC_CONCURRENT_SCAVENGER
+   /*
+    * This version of arraycopyEvaluator is designed to handle the special case where read barriers are
+    * needed for field loads. At the time of writing, read barriers are used for Concurrent Scavenge GC.
+    * If there are no read barriers then the original implementation of arraycopyEvaluator can be used.
+    */
+   if (TR::Compiler->om.readBarrierType() == gc_modron_readbar_none ||
+          !node->chkNoArrayStoreCheckArrayCopy() ||
+          !node->isReferenceArrayCopy()
+      )
+      {
+      return OMR::TreeEvaluatorConnector::arraycopyEvaluator(node, cg);
+      }
+   TR::Register *tmp1Reg = cg->allocateRegister(TR_GPR);
+   TR::Register *tmp2Reg = cg->allocateRegister(TR_GPR);
+   TR::Register *tmp3Reg = cg->allocateRegister(TR_GPR);
+   TR::Register *tmp4Reg = cg->allocateRegister(TR_GPR);
+   TR::Compilation *comp = cg->comp();
+   TR::Instruction      *gcPoint;
+   TR::Node             *srcObjNode, *dstObjNode, *srcAddrNode, *dstAddrNode, *lengthNode;
+   TR::Register         *srcObjReg, *dstObjReg, *srcAddrReg, *dstAddrReg, *lengthReg;
+   bool stopUsingCopyReg1, stopUsingCopyReg2, stopUsingCopyReg3, stopUsingCopyReg4, stopUsingCopyReg5 = false;
+
+   srcObjNode = node->getChild(0);
+   dstObjNode = node->getChild(1);
+   srcAddrNode = node->getChild(2);
+   dstAddrNode = node->getChild(3);
+   lengthNode = node->getChild(4);
+
+   // These calls evaluate the nodes and give back registers that can be clobbered if needed.
+   stopUsingCopyReg1 = TR::TreeEvaluator::stopUsingCopyReg(srcObjNode, srcObjReg, cg);
+   stopUsingCopyReg2 = TR::TreeEvaluator::stopUsingCopyReg(dstObjNode, dstObjReg, cg);
+   stopUsingCopyReg3 = TR::TreeEvaluator::stopUsingCopyReg(srcAddrNode, srcAddrReg, cg);
+   stopUsingCopyReg4 = TR::TreeEvaluator::stopUsingCopyReg(dstAddrNode, dstAddrReg, cg);
+
+   lengthReg = cg->evaluate(lengthNode);
+   if (!cg->canClobberNodesRegister(lengthNode))
+      {
+      TR::Register *lenCopyReg = cg->allocateRegister();
+      generateMovInstruction(cg, lengthNode, lenCopyReg, lengthReg, true);
+      lengthReg = lenCopyReg;
+      stopUsingCopyReg5 = true;
+      }
+
+   // Inline forward arrayCopy with constant length.
+   int64_t len = -1;
+   if (node->isForwardArrayCopy() && lengthNode->getOpCode().isLoadConst())
+      {
+      len = (lengthNode->getType().isInt32() ? lengthNode->getInt() : lengthNode->getLongInt());
+
+      // inlineArrayCopy is not currently capable of handling very long lengths correctly. Under some circumstances,
+      // it will generate an li instruction with an out-of-bounds immediate, which triggers an assert in the binary
+      // encoder.
+      if (len >= 0)
+         {
+         /*
+          * This path generates code to perform a runtime check on whether concurrent GC is done moving objects or not.
+          * If it isn't, a call to referenceArrayCopy helper should be made.
+          * If it is, using the inlined array copy code path is okay.
+          */
+
+         uint8_t numDeps = 12;
+
+         // These registers are used when taking the referenceArrayCopy helper call path.
+         TR::Register *x0Reg = cg->allocateRegister();
+         TR::Register *metaReg = cg->getMethodMetaDataRegister();
+         TR::Register *tmp1Reg = cg->allocateRegister();
+         TR::Register *tmp2Reg = cg->allocateRegister();
+
+         /*
+          * x0-x5 are used to pass parameters to the referenceArrayCopy helper.
+          * r11 is used for the tmp1Reg since r11 gets killed by the trampoline and values put into tmp1Reg are not needed after the trampoline.
+          */
+         TR::RegisterDependencyConditions *deps = new (cg->trHeapMemory()) TR::RegisterDependencyConditions(0, numDeps, cg->trMemory());
+         deps->addPostCondition(metaReg, TR::RealRegister::NoReg);
+
+         deps->addPostCondition(x0Reg, TR::RealRegister::x0);
+         deps->addPostCondition(srcObjReg, TR::RealRegister::x1);
+         deps->addPostCondition(dstObjReg, TR::RealRegister::x2);
+         deps->addPostCondition(srcAddrReg, TR::RealRegister::x3);
+         deps->addPostCondition(dstAddrReg, TR::RealRegister::x4);
+         deps->addPostCondition(lengthReg, TR::RealRegister::x5);
+
+         TR::LabelSymbol *startLabel = generateLabelSymbol(cg);
+         TR::LabelSymbol *helperLabel = generateLabelSymbol(cg);
+         TR::LabelSymbol *endLabel = generateLabelSymbol(cg);
+         startLabel->setStartInternalControlFlow();
+         endLabel->setEndInternalControlFlow();
+
+         generateLabelInstruction(cg, TR::InstOpCode::label, node, startLabel);
+
+         // Runtime check for concurrent scavenger.
+         generateTrg1MemInstruction(cg, TR::InstOpCode::ldrimmx, node, tmp1Reg,
+               new (cg->trHeapMemory())TR::MemoryReference(metaReg, offsetof(J9VMThread, readBarrierRangeCheckTop), cg));
+         generateConditionalBranchInstruction(cg, TR::InstOpCode::b_cond, node, helperLabel, TR::CC_NE);
+
+         // Generate assembly for inlined version of array copy.
+         inlineArrayCopy(node, len, srcAddrReg, dstAddrReg, cg);
+
+         generateLabelInstruction(cg, TR::InstOpCode::b, node, endLabel);
+
+         // Start of referenceArrayCopy helper path.
+         generateLabelInstruction(cg, TR::InstOpCode::label, node, helperLabel);
+
+         J9::ARM64::JNILinkage *jniLinkage = (J9::ARM64::JNILinkage*) cg->getLinkage(TR_J9JNILinkage);
+         const TR::ARM64LinkageProperties &lp = jniLinkage->getProperties();
+
+         int32_t elementSize;
+         if (comp->useCompressedPointers())
+            elementSize = TR::Compiler->om.sizeofReferenceField();
+         else
+            elementSize = (int32_t) TR::Compiler->om.sizeofReferenceAddress();
+
+         // Sign extend non-64bit Integers as required by the ABI
+         if (comp->target().isLinux())
+            {
+            OMR::TreeEvaluatorConnector::i2lEvaluator(lengthNode, cg);
+            }
+
+         // The C routine expects length measured by slots.
+         loadConstant32(cg, lengthNode, lengthNode->getInt(), lengthReg);
+
+         generateMovInstruction(cg, node, x0Reg, metaReg, true);
+
+         TR::RegisterDependencyConditions *helperDeps = new (cg->trHeapMemory()) TR::RegisterDependencyConditions(0, 0, cg->trMemory());
+         TR::SymbolReference *helperSym = comp->getSymRefTab()->findOrCreateRuntimeHelper(TR_referenceArrayCopy);
+         TR::LabelSymbol *snippetLabel = cg->lookUpSnippet(TR::Snippet::IsHelperCall, node->getSymbolReference());
+         gcPoint = generateImmSymInstruction(cg, TR::InstOpCode::bl, node, (uintptr_t)helperSym->getMethodAddress(), helperDeps, helperSym, new (cg->trHeapMemory()) TR::ARM64HelperCallSnippet(cg, node, snippetLabel, helperSym));
+         gcPoint->ARM64NeedsGCMap(cg, lp.getPreservedRegisterMapForGC());
+
+         generateLabelInstruction(cg, TR::InstOpCode::label, node, endLabel, deps);
+
+         // ToDo TR::TreeEvaluator::genWrtbarForArrayCopy(node, srcObjReg, dstObjReg, cg);
+
+         cg->decReferenceCount(srcObjNode);
+         cg->decReferenceCount(dstObjNode);
+         cg->decReferenceCount(srcAddrNode);
+         cg->decReferenceCount(dstAddrNode);
+         cg->decReferenceCount(lengthNode);
+
+         if (stopUsingCopyReg1)
+            cg->stopUsingRegister(srcObjReg);
+         if (stopUsingCopyReg2)
+            cg->stopUsingRegister(dstObjReg);
+         if (stopUsingCopyReg3)
+            cg->stopUsingRegister(srcAddrReg);
+         if (stopUsingCopyReg4)
+            cg->stopUsingRegister(dstAddrReg);
+         if (stopUsingCopyReg5)
+            cg->stopUsingRegister(lengthReg);
+
+         cg->machine()->setLinkRegisterKilled(true);
+
+         return NULL;
+         }
+      }
+
+   /*
+    * This path also generates code to perform a runtime check on whether concurrent GC is done moving objects or not.
+    * If it isn't done, once again a call to referenceArrayCopy helper should be made.
+    * If it is done, using the assembly helpers code path is okay.
+    */
+
+   // These registers are used when taking the referenceArrayCopy helper call path.
+   TR::Register *x0Reg = cg->allocateRegister();
+   TR::Register *x1Reg = cg->allocateRegister();
+   TR::Register *metaReg = cg->getMethodMetaDataRegister();
+
+   static bool disableArrayCopy = feGetEnv("TR_disableArrayCopyInline") ? true : false;
+
+#if defined(DEBUG) || defined(PROD_WITH_ASSUMES)
+   static bool verboseArrayCopy = (feGetEnv("TR_verboseArrayCopy") != NULL);       //Check which helper is getting used.
+   if (verboseArrayCopy)
+      fprintf(stderr, "arraycopy [0x%p] isReferenceArrayCopy:[%d] isForwardArrayCopy:[%d] isHalfWordElementArrayCopy:[%d] isWordElementArrayCopy:[%d] %s @ %s\n",
+               node,
+               0,
+               node->isForwardArrayCopy(),
+               node->isHalfWordElementArrayCopy(),
+               node->isWordElementArrayCopy(),
+               comp->signature(),
+               comp->getHotnessName(comp->getMethodHotness())
+               );
+#endif
+
+   /*
+    * The minimum number of dependencies used by the assembly helpers path is 8.
+    * The number of dependencies added by the referenceArrayCopy helper call path is 5.
+    */
+   int32_t numDeps = 15;
+
+   TR::RegisterDependencyConditions *deps = new (cg->trHeapMemory()) TR::RegisterDependencyConditions(numDeps, numDeps, cg->trMemory());
+
+   /*
+    * Build up the dependency conditions for assembly helper path.
+    * Unfortunately, the two different paths have a conflict regarding which real register they want srcAddrReg, dstAddrReg and lengthReg in.
+    * Dependencies are set up to favour the fast assembly path. Register moves are used in the slow helper path to move the values to the
+    * real registers they are expected to be in.
+    */
+
+   TR::addDependency(deps, lengthReg, TR::RealRegister::NoReg, TR_GPR, cg);
+   TR::addDependency(deps, srcAddrReg, TR::RealRegister::NoReg, TR_GPR, cg);
+   TR::addDependency(deps, dstAddrReg, TR::RealRegister::NoReg, TR_GPR, cg);
+
+
+   // Add dependencies for the referenceArrayCopy helper call path.
+   TR::addDependency(deps, x0Reg, TR::RealRegister::x0, TR_GPR, cg);
+   TR::addDependency(deps, x1Reg, TR::RealRegister::x1, TR_GPR, cg);
+
+   TR::addDependency(deps, srcObjReg, TR::RealRegister::NoReg, TR_GPR, cg);
+   TR::addDependency(deps, dstObjReg, TR::RealRegister::NoReg, TR_GPR, cg);
+   TR::addDependency(deps, metaReg, TR::RealRegister::NoReg, TR_GPR, cg);
+
+   TR::LabelSymbol *startLabel = generateLabelSymbol(cg);
+   TR::LabelSymbol *helperLabel = generateLabelSymbol(cg);
+   TR::LabelSymbol *endLabel = generateLabelSymbol(cg);
+   startLabel->setStartInternalControlFlow();
+   endLabel->setEndInternalControlFlow();
+
+   generateLabelInstruction(cg, TR::InstOpCode::label, node, startLabel);
+
+   // Runtime check for concurrent scavenger.
+   generateTrg1MemInstruction(cg, TR::InstOpCode::ldrimmx, node, tmp1Reg,
+         new (cg->trHeapMemory())TR::MemoryReference(metaReg, offsetof(J9VMThread, readBarrierRangeCheckTop), cg));
+   generateTrg1ImmInstruction(cg, TR::InstOpCode::b_cond, node, tmp1Reg, 0);
+   generateConditionalBranchInstruction(cg, TR::InstOpCode::b_cond, node, helperLabel, TR::CC_NE);
+
+   // Start of assembly helper path.
+   TR_RuntimeHelper helper;
+
+   if (node->isForwardArrayCopy())
+      {
+      helper = TR_ARM64forwardArrayCopy;
+      }
+   else
+      {
+      helper = TR_ARM64arrayCopy;
+      }
+   TR::SymbolReference *helperSymbol = cg->symRefTab()->findOrCreateRuntimeHelper(helper);
+   //generateImmSymInstruction(cg, TR::InstOpCode::bl, node, (uintptr_t)helperSymbol->getMethodAddress(), helperSymbol);
+
+   generateLabelInstruction(cg, TR::InstOpCode::b, node, endLabel);
+
+   // Start of referenceArrayCopy helper path.
+   generateLabelInstruction(cg, TR::InstOpCode::label, node, helperLabel);
+
+   J9::ARM64::JNILinkage *jniLinkage = (J9::ARM64::JNILinkage*) cg->getLinkage(TR_J9JNILinkage);
+   const TR::ARM64LinkageProperties &lp = jniLinkage->getProperties();
+
+   int32_t elementSize;
+   if (comp->useCompressedPointers())
+      elementSize = TR::Compiler->om.sizeofReferenceField();
+   else
+      elementSize = (int32_t) TR::Compiler->om.sizeofReferenceAddress();
+
+   // Sign extend non-64bit Integers as required by the ABI
+   if (comp->target().isLinux())
+      {
+      OMR::TreeEvaluatorConnector::i2lEvaluator(lengthNode, cg);
+      }
+
+   // The C routine expects length measured by slots.
+   //generateTrg1ImmInstruction(cg, TR::InstOpCode::movkw, node, lengthReg, lengthReg >> trailingZeroes(elementSize));
+
+   /*
+    * Parameters are set up here
+    * x0 = vmThread
+    * x1 = srcObj
+    * x2 = dstObj
+    * x3 = srcAddr
+    * x4 = dstAddr
+    * x5 = length
+    *
+    * CAUTION: Virtual register names are based on their use during the non-helper path so they are misleading after this point.
+    * Due to register reuse, pay attention to copying order so that a register is not clobbered too early.
+    */
+   generateMovInstruction(cg, node, x0Reg, metaReg, true);
+   generateMovInstruction(cg, node, x1Reg, srcObjReg, true);
+   generateMovInstruction(cg, node, tmp1Reg, dstObjReg, true);    //tmp1Reg is tied to x2.
+   generateMovInstruction(cg, node, tmp2Reg, srcAddrReg, true);   //tmp2Reg is tied to x3.
+   generateMovInstruction(cg, node, srcAddrReg, lengthReg, true); //srcAddrReg is tied to x5. Need to copy srcAddrReg first.
+   generateMovInstruction(cg, node, lengthReg, dstAddrReg, true); //lengthReg is tied to x4.  Need to copy lengthReg first.
+
+   TR::RegisterDependencyConditions *helperDeps = new (cg->trHeapMemory()) TR::RegisterDependencyConditions(0, 0, cg->trMemory());
+   TR::SymbolReference *helperSym = comp->getSymRefTab()->findOrCreateRuntimeHelper(TR_referenceArrayCopy);
+   TR::LabelSymbol *snippetLabel = NULL;
+   snippetLabel = cg->lookUpSnippet(TR::Snippet::IsHelperCall, node->getSymbolReference());
+   gcPoint = generateImmSymInstruction(cg, TR::InstOpCode::bl, node, (uintptr_t)helperSym->getMethodAddress(), helperDeps, helperSym, new (cg->trHeapMemory()) TR::ARM64HelperCallSnippet(cg, node, snippetLabel, helperSym));
+   gcPoint->ARM64NeedsGCMap(cg, lp.getPreservedRegisterMapForGC());
+
+   generateLabelInstruction(cg, TR::InstOpCode::label, node, endLabel, deps);
+
+   // ToDo: TR::TreeEvaluator::genWrtbarForArrayCopy(node, srcObjReg, dstObjReg, cg);
+
+   cg->decReferenceCount(srcObjNode);
+   cg->decReferenceCount(dstObjNode);
+   cg->decReferenceCount(srcAddrNode);
+   cg->decReferenceCount(dstAddrNode);
+   cg->decReferenceCount(lengthNode);
+
+   if (stopUsingCopyReg1)
+      cg->stopUsingRegister(srcObjReg);
+   if (stopUsingCopyReg2)
+      cg->stopUsingRegister(dstObjReg);
+   if (stopUsingCopyReg3)
+      cg->stopUsingRegister(srcAddrReg);
+   if (stopUsingCopyReg4)
+      cg->stopUsingRegister(dstAddrReg);
+   if (stopUsingCopyReg5)
+      cg->stopUsingRegister(lengthReg);
+
+   cg->machine()->setLinkRegisterKilled(true);
+
+   return NULL;
+#else /* OMR_GC_CONCURRENT_SCAVENGER */
+   return OMR::TreeEvaluatorConnector::arraycopyEvaluator(node, cg);
+#endif /* OMR_GC_CONCURRENT_SCAVENGER */
+   }
+
 static TR::Register *
 VMarrayCheckEvaluator(TR::Node *node, TR::CodeGenerator *cg)
    {
